@@ -21,6 +21,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "microjson",
  "reqwless",
  "smoltcp",
  "static_cell",
@@ -1516,6 +1517,12 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+
+[[package]]
+name = "microjson"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66f607672273239fe03881b7ce95721079e1d08f6a7ef98da2b144f68fe1502c"
 
 [[package]]
 name = "nb"

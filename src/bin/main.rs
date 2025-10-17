@@ -6,7 +6,11 @@
     holding buffers for the duration of a data transfer."
 )]
 
-use defmt::info;
+use core::str::FromStr;
+
+use alloc::string::String;
+
+use defmt::{info, Debug2Format};
 use embassy_executor::Spawner;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
@@ -26,6 +30,7 @@ use esp_radio::{
     ble::controller::BleConnector,
     wifi::{self, ClientConfig, ModeConfig},
 };
+use microjson::JSONValue;
 use reqwless::client::{HttpClient, TlsConfig};
 use reqwless::{self, response};
 use static_cell::StaticCell;
@@ -52,6 +57,7 @@ macro_rules! mk_static {
     }};
 }
 
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     // generator version: 0.6.0
@@ -59,9 +65,9 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 64 * 1024);
+    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 32 * 1024);
     // COEX needs more RAM - so we've added some more
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 32 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
@@ -111,59 +117,34 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Sta addr: {:?}", sta_address);
 
-    access_website(sta_stack, tls_seed).await;
+    let unparsed_response = access_website(sta_stack, tls_seed).await.unwrap();
 
-    // let mut rx_buffer = [0; 4096];
-    // let mut tx_buffer = [0; 4096];
+    let response_json = parse_json(&unparsed_response);
 
-    // // TODO: Spawn some tasks
-    // let _ = spawner;
+    info!("Json: {}", Debug2Format(&response_json));
 
-    // let url = "https://iotjukebox.onrender.com/song";
-    // let tcp_state = TcpClientState::<1, 4096, 4096>::new();
-    // let tcp_client = TcpClient::new(sta_stack, &tcp_state);
-    // let dns_socket = DnsSocket::new(sta_stack);
-
-    // let tls = TlsConfig::new(
-    //     tls_seed,
-    //     &mut rx_buffer,
-    //     &mut tx_buffer,
-    //     reqwless::client::TlsVerify::None,
-    // );
-    // let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls);
-
-    // let mut http_req = client
-    //     .request(reqwless::request::Method::GET, url)
-    //     .await
-    //     .expect("request failed");
-
-    // let mut buffer = [0u8; 4096];
-
-    // let response = http_req
-    //     .send(&mut buffer)
-    //     .await
-    //     .unwrap();
-
-    // info!("Got response");
-
-    // let res = response.body().read_to_end().await.unwrap();
-    // let content = core::str::from_utf8(res).unwrap();
-    // info!("{:?}", content);
 
     loop {
         Timer::after(Duration::from_secs(2)).await;
         //
-        let addrs = sta_stack
-            .dns_query("iotjukebox.onrender.com", embassy_net::dns::DnsQueryType::A)
-            .await
-            .expect("No ip address found");
+        // let addrs = sta_stack
+        //     .dns_query("iotjukebox.onrender.com", embassy_net::dns::DnsQueryType::A)
+        //     .await
+        //     .expect("No ip address found");
 
-        info!("Ip: {:?}", addrs);
+        // info!("Ip: {:?}", addrs);
+        //
+
+        info!("Waiting");
 
         // let remote_endpoint =
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
+}
+
+fn parse_json<'a>(unparsed_response: &'a str) -> JSONValue<'a> {
+    JSONValue::load_and_verify(&unparsed_response).unwrap()
 }
 
 // #[embassy_executor::task]
@@ -226,14 +207,14 @@ async fn connection(mut controller: WifiController<'static>) {
 // static TLS_TX: StaticCell<[u8; 4096]> = StaticCell::new();
 // static HTTP_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
 
-async fn access_website(stack: Stack<'_>, tls_seed: u64) {
-    // let rx_buffer: &mut [u8; 4096] = TLS_RX.init([0; 4096]);
+async fn access_website(stack: Stack<'_>, tls_seed: u64) -> Result<String, Error>{
+    // let rx_buffer: &mut [u8; 4096*5] = TLS_RX.init([0; 4096]);
     // let tx_buffer: &mut [u8; 4096] = TLS_TX.init([0; 4096]);
     // let http_buf: &mut [u8; 4096] = HTTP_BUF.init([0; 4096]);
 
     let mut tx_buffer = [0; 4096];
-    let mut rx_buffer = [0; 4096];
-    let mut http_buf = [0; 4096*5];
+    let mut rx_buffer = [0; 4096*5];
+    let mut http_buf = [0; 4096];
     const TCP_RX: usize = 4096;
     const TCP_TX: usize = 4096;
 
@@ -267,6 +248,9 @@ async fn access_website(stack: Stack<'_>, tls_seed: u64) {
 
     let content = core::str::from_utf8(res).unwrap();
     info!("{}", content);
+
+    let content = String::from_str(content).unwrap();
+    Ok(content)
 }
 
 // #[embassy_executor::task]

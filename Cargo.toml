@@ -71,6 +71,7 @@ trouble-host = { version = "0.5.0", features = ["gatt"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 reqwless = {version = "0.13.0" , features = ["defmt", "embedded-tls"]}
+microjson = "0.1.6"
 
 
 [profile.dev]
