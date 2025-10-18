@@ -72,6 +72,8 @@ critical-section = "1.2.0"
 static_cell      = "2.1.1"
 reqwless = {version = "0.13.0" , features = ["defmt", "embedded-tls"]}
 microjson = "0.1.6"
+# esp-hal-buzzer = { version = "0.2.0", features = ["defmt", "esp32"] }
+esp-hal-buzzer = {git = "https://github.com/KapJ1coH/esp-hal-community.git", version = "0.2.0", features = ["defmt", "esp32"] }
 
 
 [profile.dev]

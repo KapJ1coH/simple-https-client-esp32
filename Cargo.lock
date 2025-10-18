@@ -18,6 +18,7 @@ dependencies = [
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
+ "esp-hal-buzzer",
  "esp-println",
  "esp-radio",
  "esp-rtos",
@@ -898,6 +899,16 @@ dependencies = [
  "ufmt-write",
  "xtensa-lx",
  "xtensa-lx-rt",
+]
+
+[[package]]
+name = "esp-hal-buzzer"
+version = "0.2.0"
+source = "git+https://github.com/KapJ1coH/esp-hal-community.git#41644854917d3913bc56cd60376878d820f77f2b"
+dependencies = [
+ "defmt 1.0.1",
+ "document-features",
+ "esp-hal",
 ]
 
 [[package]]

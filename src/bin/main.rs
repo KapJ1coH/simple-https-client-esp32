@@ -10,30 +10,32 @@ use core::str::FromStr;
 
 use alloc::string::String;
 
-use defmt::{info, Debug2Format};
+use alloc::vec::Vec;
+use defmt::{Debug2Format, error, info};
 use embassy_executor::Spawner;
+use embassy_net::Stack;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_net::{IpEndpoint, Stack};
-use embassy_net::{
-    IpListenEndpoint, Ipv4Cidr, Runner, StackResources, StaticConfigV4, tcp::TcpSocket,
-};
+use embassy_net::{Runner, StackResources};
 
 use embassy_time::{Duration, Timer};
-use esp_hal::rsa::Rsa;
-use esp_hal::time;
+use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::{clock::CpuClock, rng::Rng};
+use esp_hal::{
+    ledc::{LSGlobalClkSource, Ledc, channel, timer},
+    main,
+};
+use esp_hal_buzzer::{Buzzer, ToneValue, notes::*, song};
 use esp_radio::Controller;
-use esp_radio::wifi::{ScanConfig, WifiController, WifiDevice, WifiEvent, WifiStaState};
+use esp_radio::wifi::{ScanConfig, WifiController, WifiDevice, WifiStaState};
 use esp_radio::{
     ble::controller::BleConnector,
     wifi::{self, ClientConfig, ModeConfig},
 };
 use microjson::JSONValue;
 use reqwless::client::{HttpClient, TlsConfig};
-use reqwless::{self, response};
-use static_cell::StaticCell;
+use reqwless::{self};
 use trouble_host::prelude::*;
 use {esp_backtrace as _, esp_println as _};
 
@@ -43,6 +45,8 @@ const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 1;
 const SSID: &str = "Not a honeypot";
 const PASSWORD: &str = "Nbvf12nbvf12";
+// const SSID: &str = "Kap";
+// const PASSWORD: &str = "Nbvf12nbvf12";
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -56,7 +60,6 @@ macro_rules! mk_static {
         x
     }};
 }
-
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -78,10 +81,10 @@ async fn main(spawner: Spawner) -> ! {
     let radio_init = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
 
     let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
+        esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
     // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
-    let transport = BleConnector::new(&radio_init, peripherals.BT, Default::default()).unwrap();
+    let transport = BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
     let ble_controller = ExternalController::<_, 20>::new(transport);
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
@@ -117,15 +120,108 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Sta addr: {:?}", sta_address);
 
-    let unparsed_response = access_website(sta_stack, tls_seed).await.unwrap();
+    let unparsed_response = send_get(sta_stack, tls_seed).await.unwrap();
 
     let response_json = parse_json(&unparsed_response);
 
     info!("Json: {}", Debug2Format(&response_json));
 
+    let mut freqs = Vec::new();
+    let mut times = Vec::new();
+
+    let tempo = response_json
+        .get_key_value("tempo")
+        .unwrap()
+        .read_string()
+        .unwrap()
+        .trim_matches('"')
+        .parse::<u32>()
+        .unwrap();
+
+    let wholenote = (600_000 * 4) / tempo; 
+
+    for (i, v) in response_json
+        .get_key_value("melody")
+        .unwrap()
+        .iter_array()
+        .unwrap()
+        .enumerate()
+    {
+        let val = v
+            .read_string()
+            .expect("String")
+            .trim_matches(['\\', '"'])
+            .parse::<i32>();
+
+        match val {
+            Ok(val) => {
+                if i % 2 == 0 {
+                    freqs.push(val);
+                } else if val < 0 {
+                    let _val = val.abs() - val.abs() / 2;
+                    times.push(wholenote / (_val * 10) as u32);
+                } else {
+                    times.push(wholenote / (val * 10) as u32);
+                }
+            }
+            Err(_) => error!("Parsing error {}", Debug2Format(&v)),
+        }
+    }
+
+    // // let mut buzzer_pin = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
+
+    // let sound_ratio = 0.9;
+
+
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+
+    let mut buzzer = Buzzer::new(
+        &ledc,
+        timer::Number::Timer0,
+        channel::Number::Channel1,
+        peripherals.GPIO21,
+    );
+
+    let freqs_u32: Vec<u32> = freqs
+        .iter()
+        .copied()
+        .map(|x| u32::try_from(x).expect("negative freq"))
+        .collect();
+
+    let times_u32: Vec<u32> = times
+        .iter()
+        .copied()
+        .map(|x| u32::try_from(x).expect("negative time"))
+        .collect();
+
+    // now take slices that live as long as the Vecs
+    let freqs_slice: &[u32] = &freqs_u32;
+    let times_slice: &[u32] = &times_u32;
+
+    info!("Freqs: {:?}", Debug2Format(&freqs_slice));
+    info!("Times: {:?}", Debug2Format(&times_slice));
+
+
+
+    // for (freq, time) in freqs.iter().zip(times.iter_mut()) {
+    //     let duration: u64 = ms_per_beat as u64 * (4 / *time as u64);
+
+    //     if *time as u64 > 0 {
+    //         buzzer_pin.set_high();
+    //         let _dur = duration as f64 * sound_ratio;
+    //         Timer::after_millis(_dur as u64).await;
+    //         buzzer_pin.set_low();
+    //         Timer::after_millis((_dur * (1.0-sound_ratio)) as u64).await;
+
+    //     } else {
+    //         buzzer_pin.set_low();
+    //         Timer::after_millis(duration).await;
+    //     }
+
+    // }
 
     loop {
-        Timer::after(Duration::from_secs(2)).await;
         //
         // let addrs = sta_stack
         //     .dns_query("iotjukebox.onrender.com", embassy_net::dns::DnsQueryType::A)
@@ -134,8 +230,14 @@ async fn main(spawner: Spawner) -> ! {
 
         // info!("Ip: {:?}", addrs);
         //
+        buzzer
+            .play_tones_from_slice(freqs_slice, times_slice)
+            .expect("can't play shit");
 
-        info!("Waiting");
+        // buzzer.play_song(&DOOM).unwrap();
+
+        info!("Replay");
+        Timer::after(Duration::from_secs(2)).await;
 
         // let remote_endpoint =
     }
@@ -144,7 +246,7 @@ async fn main(spawner: Spawner) -> ! {
 }
 
 fn parse_json<'a>(unparsed_response: &'a str) -> JSONValue<'a> {
-    JSONValue::load_and_verify(&unparsed_response).unwrap()
+    JSONValue::load_and_verify(unparsed_response).unwrap()
 }
 
 // #[embassy_executor::task]
@@ -203,17 +305,9 @@ async fn connection(mut controller: WifiController<'static>) {
     }
 }
 
-// static TLS_RX: StaticCell<[u8; 4096]> = StaticCell::new();
-// static TLS_TX: StaticCell<[u8; 4096]> = StaticCell::new();
-// static HTTP_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
-
-async fn access_website(stack: Stack<'_>, tls_seed: u64) -> Result<String, Error>{
-    // let rx_buffer: &mut [u8; 4096*5] = TLS_RX.init([0; 4096]);
-    // let tx_buffer: &mut [u8; 4096] = TLS_TX.init([0; 4096]);
-    // let http_buf: &mut [u8; 4096] = HTTP_BUF.init([0; 4096]);
-
+async fn send_get(stack: Stack<'_>, tls_seed: u64) -> Result<String, Error> {
     let mut tx_buffer = [0; 4096];
-    let mut rx_buffer = [0; 4096*5];
+    let mut rx_buffer = [0; 4096 * 5];
     let mut http_buf = [0; 4096];
     const TCP_RX: usize = 4096;
     const TCP_TX: usize = 4096;
@@ -281,3 +375,690 @@ async fn access_website(stack: Stack<'_>, tls_seed: u64) -> Result<String, Error
 //         .unwrap();
 
 // }
+//
+
+pub const DOOM: [ToneValue; 680] = song!(
+    225,
+    [
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_FS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_FS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_FS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_FS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_DS3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_DS3, DOTTED_HALF_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_DS3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_C4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_CS4, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_B3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_CS3, EIGHTEENTH_NOTE),
+        (NOTE_GS3, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_B3, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_F3, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_FS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_DS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_FS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_DS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_DS4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_DS3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_DS3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_F3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_G3, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A2, EIGHTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_C4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_A3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_F3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_D3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, DOTTED_HALF_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_AS2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B2, EIGHTEENTH_NOTE),
+        (NOTE_C3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_D3, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_E2, EIGHTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B2, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_C4, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_B3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_G3, DOTTED_SIXTEENTH_NOTE),
+        (NOTE_E3, DOTTED_SIXTEENTH_NOTE)
+    ]
+);
