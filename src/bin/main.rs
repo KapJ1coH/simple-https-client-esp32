@@ -6,16 +6,20 @@
     holding buffers for the duration of a data transfer."
 )]
 
+use alloc::boxed::Box;
 use core::cell::RefCell;
+use core::error;
+use core::fmt::write;
 use core::str::FromStr;
 use heapless::Deque;
 
 use alloc::string::String;
+use arrform::{ArrForm, arrform};
 
 use alloc::vec::Vec;
 use bt_hci::cmd::le::LeSetScanParams;
 use bt_hci::controller::ControllerCmdSync;
-use defmt::{Debug2Format, error, info, warn, Format};
+use defmt::{Debug2Format, Format, error, info, warn};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_net::Stack;
@@ -23,6 +27,7 @@ use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Runner, StackResources};
 
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config, I2c};
@@ -44,6 +49,24 @@ use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use {esp_backtrace as _, esp_println as _};
 
+/// Mutex protected multiple sender/consume channel
+pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
+pub static SONG_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, JSONValue, 10> = Channel::new();
+
+pub enum Event {
+    DetectedDevice(String),
+    ControllerRequest,
+}
+
+
+pub async fn send_event(event: Event) {
+    EVENT_CHANNEL.sender().send(event).await;
+}
+
+pub async fn receive_enent() -> Event {
+    EVENT_CHANNEL.receiver().receive().await
+}
+
 extern crate alloc;
 
 const CONNECTIONS_MAX: usize = 1;
@@ -56,7 +79,6 @@ const PASSWORD: &str = "Nbvf12nbvf12";
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
-
 
 #[derive(Debug, Format)]
 pub enum MyError {
@@ -136,38 +158,78 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Sta addr: {:?}", sta_address);
 
-    let unparsed_response = send_get(sta_stack, tls_seed).await.unwrap();
+    // let unparsed_response = send_get(sta_stack, tls_seed).await.unwrap();
 
     let leddc_pin = peripherals.LEDC;
     let buzzer_pin = peripherals.GPIO21;
     // show_song_name();
-    spawner
-        .spawn(play_sond(unparsed_response, leddc_pin, buzzer_pin))
-        .ok();
+    spawner.spawn(player(leddc_pin, buzzer_pin)).ok();
+    spawner.spawn(run_director(sta_stack, tls_seed)).ok();
 
     ble_scanner_run(ble_controller).await;
 
     loop {
-        //
-        // let addrs = sta_stack
-        //     .dns_query("iotjukebox.onrender.com", embassy_net::dns::DnsQueryType::A)
-        //     .await
-        //     .expect("No ip address found");
-
-        // info!("Ip: {:?}", addrs);
-        //
-        // buzzer
-        //     .play_tones_from_slice(&freqs, &times)
-        //     .expect("can't play shit");
-
-        info!("Replay");
-        Timer::after(Duration::from_secs(2)).await;
-
-        // let remote_endpoint =
+        Timer::after(Duration::from_secs(1)).await;
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
 }
+
+#[embassy_executor::task]
+pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
+    send_get(stack, tls_seed, String::new(), false, true).await;
+    loop {
+        let event = receive_enent().await;
+        handle_event(event, stack, tls_seed).await;
+    }
+}
+
+/// Handles the events sent through the channel.
+/// It will route the event to it's proper destination depending on the the type of the event.
+///
+/// For example, ParkingStateChange will go to the network to get ready for transmission.
+async fn handle_event(event: Event, stack: Stack<'static>, tls_seed: u64) {
+    match event {
+        Event::DetectedDevice(name) => {
+            let response = send_get(stack, tls_seed, name, false, false).await;
+            match response {
+                Ok(value) => {
+                    let json_response = parse_json(&value);
+                    if json_response.get_key_value("error").is_ok() {
+                        error!("Device does not exist")
+                    } else if json_response.get_key_value("name").is_ok() {
+                        let song_name = json_response
+                            .get_key_value("name")
+                            .unwrap()
+                            .read_string()
+                            .unwrap()
+                            .trim_matches('"');
+
+                        match send_get(stack, tls_seed, song_name.into(), true, false).await {
+                            Ok(response) => {
+                                let json_respnse = parse_json(&response);
+
+
+                            },
+                            Err(e) => error!("Error getting song name {}", song_name)
+                        }
+
+                    }
+
+                }
+                Err(e) => {
+                    error!("DetectedDevice failure, no clue {:?}", e);
+                }
+            }
+        }
+        Event::ControllerRequest => {
+            todo!()
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn name_to_song(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {}
 
 async fn ble_scanner_run<C>(controller: C)
 where
@@ -211,8 +273,43 @@ impl EventHandler for Printer {
         let mut seen = self.seen.borrow_mut();
         while let Some(Ok(report)) = it.next() {
             if seen.iter().find(|b| b.raw() == report.addr.raw()).is_none() {
-                info!("discovered: {:?}", report.addr);
-                info!("report: {:?}", report);
+                let data = report.data;
+                let ad_struct: Result<Vec<_>, _> = AdStructure::decode(data).collect();
+                match ad_struct {
+                    Ok(val) => {
+                        for v in val {
+                            match v {
+                                AdStructure::CompleteLocalName(name) => {
+                                    match str::from_utf8(name) {
+                                        Ok(name) => {
+                                            warn!("Found Complete Name: {:?}", name);
+                                            if let Err(_) = EVENT_CHANNEL
+                                                .sender()
+                                                .try_send(Event::DetectedDevice(name.into()))
+                                            {
+                                                error!("Enent channel send failed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("error converting name: {:?}", Debug2Format(&e));
+                                        }
+                                    }
+                                }
+                                AdStructure::ShortenedLocalName(name) => {
+                                    warn!("Found Name: {:?}", name);
+                                }
+
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("AdStructure failed: {:?}", e);
+                    }
+                }
+
+                // info!("discovered: {:?}", report.addr);
+                // info!("report: {:?}", report);
                 if seen.is_full() {
                     seen.pop_front();
                 }
@@ -223,55 +320,7 @@ impl EventHandler for Printer {
 }
 
 #[embassy_executor::task]
-async fn play_sond(
-    unparsed_response: String,
-    leddc_pin: LEDC<'static>,
-    buzzer_pin: GPIO21<'static>,
-) {
-    let response_json = parse_json(&unparsed_response);
-    info!("Json: {}", Debug2Format(&response_json));
-
-    let mut freqs = Vec::new();
-    let mut times = Vec::new();
-
-    let tempo = response_json
-        .get_key_value("tempo")
-        .unwrap()
-        .read_string()
-        .unwrap()
-        .trim_matches('"')
-        .parse::<u32>()
-        .unwrap();
-
-    let wholenote = (600_000 * 4) / tempo;
-
-    for (i, v) in response_json
-        .get_key_value("melody")
-        .unwrap()
-        .iter_array()
-        .unwrap()
-        .enumerate()
-    {
-        let val = v
-            .read_string()
-            .expect("String")
-            .trim_matches(['\\', '"'])
-            .parse::<i32>();
-
-        match val {
-            Ok(val) => {
-                if i % 2 == 0 {
-                    freqs.push(val as u32);
-                } else if val < 0 {
-                    let _val = val.abs() - val.abs() / 2;
-                    times.push(wholenote / (_val * 10) as u32);
-                } else {
-                    times.push(wholenote / (val * 10) as u32);
-                }
-            }
-            Err(_) => error!("Parsing error {}", Debug2Format(&v)),
-        }
-    }
+async fn player(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {
 
     let mut ledc = Ledc::new(leddc_pin);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
@@ -282,12 +331,64 @@ async fn play_sond(
         channel::Number::Channel1,
         buzzer_pin,
     );
-    buzzer
-        .play_tones_from_slice(&freqs, &times)
-        .expect("can't play shit");
 
-    info!("Freqs: {:?}", Debug2Format(&freqs));
-    info!("Times: {:?}", Debug2Format(&times));
+    loop {
+        let response_json = SONG_EVENT_CHANNEL.receiver().receive().await;
+
+        info!("Json: {}", Debug2Format(&response_json));
+
+        let mut freqs = Vec::new();
+        let mut times = Vec::new();
+
+        let tempo = response_json
+            .get_key_value("tempo")
+            .unwrap()
+            .read_string()
+            .unwrap()
+            .trim_matches('"')
+            .parse::<u32>()
+            .unwrap();
+
+        let wholenote = (600_000 * 4) / tempo;
+
+        for (i, v) in response_json
+            .get_key_value("melody")
+            .unwrap()
+            .iter_array()
+            .unwrap()
+            .enumerate()
+        {
+            let val = v
+                .read_string()
+                .expect("String")
+                .trim_matches(['\\', '"'])
+                .parse::<i32>();
+
+            match val {
+                Ok(val) => {
+                    if i % 2 == 0 {
+                        freqs.push(val as u32);
+                    } else if val < 0 {
+                        let _val = val.abs() - val.abs() / 2;
+                        times.push(wholenote / (_val * 10) as u32);
+                    } else {
+                        times.push(wholenote / (val * 10) as u32);
+                    }
+                }
+                Err(_) => error!("Parsing error {}", Debug2Format(&v)),
+            }
+        }
+
+
+        buzzer
+            .play_tones_from_slice(&freqs, &times)
+            .expect("can't play shit");
+
+        info!("Freqs: {:?}", Debug2Format(&freqs));
+        info!("Times: {:?}", Debug2Format(&times));
+
+    }
+
 }
 
 fn parse_json<'a>(unparsed_response: &'a str) -> JSONValue<'a> {
@@ -350,7 +451,13 @@ async fn connection(mut controller: WifiController<'static>) {
     }
 }
 
-async fn send_get(stack: Stack<'_>, tls_seed: u64) -> Result<String, MyError> {
+async fn send_get(
+    stack: Stack<'_>,
+    tls_seed: u64,
+    name: String,
+    song: bool,
+    init: bool,
+) -> Result<String, MyError> {
     let mut tx_buffer = [0; 4096];
     let mut rx_buffer = [0; 4096 * 5];
     let mut http_buf = [0; 4096];
@@ -372,45 +479,58 @@ async fn send_get(stack: Stack<'_>, tls_seed: u64) -> Result<String, MyError> {
 
     let mut client = HttpClient::new_with_tls(&tcp, &dns, tls);
     info!("Tls http client ok");
+    let mut url = ArrForm::<64>::new();
+    
+    if init {
+        let values = ["nevergonnagiveyouup", "doom"];
 
-    let url = "https://iotjukebox.onrender.com/song";
+        for value in values{
+            url = arrform!(
+                64,
+                "https://iotjukebox.onrender.com/preference?id=40093918&key='{}'&value={}",
+                name,
+                value
+            );
+
+            let mut http_req = client
+                .request(reqwless::request::Method::POST, url.as_str())
+                .await
+                .unwrap();
+            info!("http post request ok");
+
+            http_req.send(&mut http_buf).await.unwrap();
+
+        }
+
+        return Ok(String::new());
+    }
+
+
+
+    if song {
+        url = arrform!(
+            64,
+            "https://iotjukebox.onrender.com/song?name='{}'",
+            name
+        );
+
+    } else {
+        url = arrform!(
+            64,
+            "https://iotjukebox.onrender.com/preference?id=40093918&key='{}'",
+            name
+        );
+    }
+
+    // let url = write!("https://iotjukebox.onrender.com/preference?id=40093918&key='{}'", name);
     let mut http_req = client
-        .request(reqwless::request::Method::GET, url)
+        .request(reqwless::request::Method::GET, url.as_str())
         .await
         .unwrap();
     info!("http request ok");
 
     let response = http_req.send(&mut http_buf).await.unwrap();
 
-    // let mut attempt = 0;
-    // let response;
-    // loop {
-    //     attempt += 1;
-
-    //     let mut req = match client.request(reqwless::request::Method::GET, url).await {
-    //         Ok(r) => r,
-    //         Err(e) => {
-    //             error!("Request attempt {} failed: {:?}", attempt, e);
-    //             if attempt >= 3 {
-    //                 return Err(MyError::Http("Failed http after 3 tries"));
-    //             }
-    //             Timer::after(Duration::from_secs(2)).await;
-    //             continue;
-    //         }
-    //     };
-
-    //     match req.send(&mut http_buf).await {
-    //         Ok(r) => {response = r; break},
-    //         Err(e) => {
-    //             error!("Send attempt {} failed: {:?}", attempt, e);
-    //             if attempt >= 3 {
-    //                 return Err(MyError::Http("Failed http after 3 tries"));
-    //             }
-    //             Timer::after(Duration::from_secs(2)).await;
-    //             continue;
-    //         }
-    //     }
-    // };
 
     info!("Got response");
     let res = response.body().read_to_end().await.unwrap();

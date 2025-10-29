@@ -83,6 +83,8 @@ esp-hal-buzzer = {git = "https://github.com/KapJ1coH/esp-hal-community.git", ver
 ssd1306 = { version = "0.10.0", features = ["async"] }
 heapless = { version = "0.9.1", features = ["defmt"] }
 embassy-futures = { version = "0.1.2", features = ["defmt"] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+arrform = "0.1.1"
 
 
 [profile.dev]
