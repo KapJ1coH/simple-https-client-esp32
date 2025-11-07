@@ -6,15 +6,17 @@
     holding buffers for the duration of a data transfer."
 )]
 
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use core::cell::RefCell;
 use core::error;
-use core::fmt::write;
+use core::fmt::Write;
 use core::str::FromStr;
+use embassy_sync::signal::Signal;
 use heapless::Deque;
 
 use alloc::string::String;
-use arrform::{ArrForm, arrform};
+// use arrform::{ArrForm, arrform};
 
 use alloc::vec::Vec;
 use bt_hci::cmd::le::LeSetScanParams;
@@ -24,7 +26,7 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_net::Stack;
 use embassy_net::dns::DnsSocket;
-use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_net::tcp::client::{TcpClient, TcpClientState, TcpConnection};
 use embassy_net::{Runner, StackResources};
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
@@ -43,7 +45,7 @@ use esp_radio::{
     wifi::{self, ClientConfig, ModeConfig},
 };
 use microjson::JSONValue;
-use reqwless::client::{HttpClient, TlsConfig};
+use reqwless::client::{HttpClient, HttpRequestHandle, TlsConfig};
 use reqwless::{self};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
@@ -53,11 +55,12 @@ use {esp_backtrace as _, esp_println as _};
 pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
 pub static SONG_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, JSONValue, 10> = Channel::new();
 
+pub static INIT_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 pub enum Event {
     DetectedDevice(String),
     ControllerRequest,
 }
-
 
 pub async fn send_event(event: Event) {
     EVENT_CHANNEL.sender().send(event).await;
@@ -77,7 +80,7 @@ const PASSWORD: &str = "Nbvf12nbvf12";
 // const PASSWORD: &str = "Nbvf12nbvf12";
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
+// For more information see: <http://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
 #[derive(Debug, Format)]
@@ -124,7 +127,7 @@ async fn main(spawner: Spawner) -> ! {
     let (mut _wifi_controller, _interfaces) =
         esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
-    // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
+    // find more examples http://github.com/embassy-rs/trouble/tree/main/examples/esp32
     let transport = BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
     let ble_controller: ExternalController<_, 1> = ExternalController::new(transport);
 
@@ -164,23 +167,33 @@ async fn main(spawner: Spawner) -> ! {
     let buzzer_pin = peripherals.GPIO21;
     // show_song_name();
     spawner.spawn(player(leddc_pin, buzzer_pin)).ok();
-    spawner.spawn(run_director(sta_stack, tls_seed)).ok();
+    spawner.spawn(run_director(sta_stack)).ok();
 
-    ble_scanner_run(ble_controller).await;
+    spawner.spawn(ble_scanner_run(ble_controller)).ok();
 
     loop {
         Timer::after(Duration::from_secs(1)).await;
     }
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
+    // for inspiration have a look at the examples at http://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
 }
 
 #[embassy_executor::task]
-pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
-    send_get(stack, tls_seed, String::new(), false, true).await;
+pub async fn run_director(stack: Stack<'static>) {
+    const TCP_RX: usize = 4096;
+    const TCP_TX: usize = 4096;
+
+    let dns = DnsSocket::new(stack);
+    let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
+    let tcp = TcpClient::new(stack, &tcp_state);
+
+    let mut client = HttpClient::new(&tcp, &dns);
+    let _ = send_get(&mut client, String::new(), false, true).await;
+    INIT_SIGNAL.signal(());
+
     loop {
         let event = receive_enent().await;
-        handle_event(event, stack, tls_seed).await;
+        handle_event(event, &mut client).await;
     }
 }
 
@@ -188,16 +201,21 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
 /// It will route the event to it's proper destination depending on the the type of the event.
 ///
 /// For example, ParkingStateChange will go to the network to get ready for transmission.
-async fn handle_event(event: Event, stack: Stack<'static>, tls_seed: u64) {
+async fn handle_event(
+    event: Event,
+    client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
+) {
     match event {
         Event::DetectedDevice(name) => {
-            let response = send_get(stack, tls_seed, name, false, false).await;
+            info!("DetectedDevice");
+            let response = send_get(client, name, false, false).await;
             match response {
                 Ok(value) => {
                     let json_response = parse_json(&value);
                     if json_response.get_key_value("error").is_ok() {
                         error!("Device does not exist")
                     } else if json_response.get_key_value("name").is_ok() {
+                        info!("Got the name, sending request");
                         let song_name = json_response
                             .get_key_value("name")
                             .unwrap()
@@ -205,17 +223,13 @@ async fn handle_event(event: Event, stack: Stack<'static>, tls_seed: u64) {
                             .unwrap()
                             .trim_matches('"');
 
-                        match send_get(stack, tls_seed, song_name.into(), true, false).await {
+                        match send_get(client, song_name.into(), true, false).await {
                             Ok(response) => {
                                 let json_respnse = parse_json(&response);
-
-
-                            },
-                            Err(e) => error!("Error getting song name {}", song_name)
+                            }
+                            Err(e) => error!("Error getting song name {}", song_name),
                         }
-
                     }
-
                 }
                 Err(e) => {
                     error!("DetectedDevice failure, no clue {:?}", e);
@@ -231,10 +245,19 @@ async fn handle_event(event: Event, stack: Stack<'static>, tls_seed: u64) {
 #[embassy_executor::task]
 async fn name_to_song(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {}
 
-async fn ble_scanner_run<C>(controller: C)
-where
-    C: Controller + ControllerCmdSync<LeSetScanParams>,
+// #[embassy_executor::task]
+// async fn ble_task(controller: Controller) {
+
+// }
+
+#[embassy_executor::task]
+async fn ble_scanner_run(controller: ExternalController<BleConnector<'static>, 1>)
+// where
+//     C: Controller + ControllerCmdSync<LeSetScanParams>,
 {
+    // Timer::after(Duration::from_secs(20)).await;
+    //
+    INIT_SIGNAL.wait().await;
     let address: Address = Address::random([0xff, 0x8f, 0x1b, 0x05, 0xe4, 0xff]);
 
     info!("Our address ={:?}", address);
@@ -262,6 +285,7 @@ where
         }
     })
     .await;
+    error!("completed ble scanner task");
 }
 
 struct Printer {
@@ -270,50 +294,50 @@ struct Printer {
 
 impl EventHandler for Printer {
     fn on_adv_reports(&self, mut it: LeAdvReportsIter<'_>) {
+        info!("Report!");
         let mut seen = self.seen.borrow_mut();
         while let Some(Ok(report)) = it.next() {
-            if seen.iter().find(|b| b.raw() == report.addr.raw()).is_none() {
-                let data = report.data;
-                let ad_struct: Result<Vec<_>, _> = AdStructure::decode(data).collect();
-                match ad_struct {
-                    Ok(val) => {
-                        for v in val {
-                            match v {
-                                AdStructure::CompleteLocalName(name) => {
-                                    match str::from_utf8(name) {
-                                        Ok(name) => {
-                                            warn!("Found Complete Name: {:?}", name);
-                                            if let Err(_) = EVENT_CHANNEL
-                                                .sender()
-                                                .try_send(Event::DetectedDevice(name.into()))
-                                            {
-                                                error!("Enent channel send failed");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("error converting name: {:?}", Debug2Format(&e));
-                                        }
-                                    }
-                                }
-                                AdStructure::ShortenedLocalName(name) => {
-                                    warn!("Found Name: {:?}", name);
-                                }
+            let addr = report.addr;
+            let data = report.data;
+            let ad_struct: Result<Vec<_>, _> = AdStructure::decode(data).collect();
 
-                                _ => {}
+            if let Ok(val) = ad_struct {
+                let mut clean_name = None;
+                info!("ad struct");
+                for v in val {
+                    match v {
+                        AdStructure::ShortenedLocalName(name)
+                        | AdStructure::CompleteLocalName(name) => match str::from_utf8(name) {
+                            Ok(name) => {
+                                warn!("Found Complete Name: {}", name);
+                                // clean_name = Some(name.trim_start().trim_start().to_owned());
+                                clean_name = Some(name.to_owned());
+                                // warn!("Trimmed name: {}", name.trim_start().trim_start());
                             }
-                        }
-                    }
-                    Err(e) => {
-                        error!("AdStructure failed: {:?}", e);
+                            Err(e) => {
+                                error!("error converting name: {:?}", Debug2Format(&e));
+                            }
+                        },
+                        _ => {}
                     }
                 }
 
-                // info!("discovered: {:?}", report.addr);
-                // info!("report: {:?}", report);
-                if seen.is_full() {
-                    seen.pop_front();
+                if let Some(name) = clean_name
+                    && !seen.iter().any(|b| b.raw() == addr.raw())
+                {
+                    if EVENT_CHANNEL
+                        .sender()
+                        .try_send(Event::DetectedDevice(name))
+                        .is_err()
+                    {
+                        error!("Enent channel send failed");
+                    }
+
+                    if seen.is_full() {
+                        seen.pop_front();
+                    }
+                    seen.push_back(addr).ok();
                 }
-                seen.push_back(report.addr).unwrap();
             }
         }
     }
@@ -321,7 +345,6 @@ impl EventHandler for Printer {
 
 #[embassy_executor::task]
 async fn player(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {
-
     let mut ledc = Ledc::new(leddc_pin);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
@@ -379,16 +402,13 @@ async fn player(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {
             }
         }
 
-
         buzzer
             .play_tones_from_slice(&freqs, &times)
             .expect("can't play shit");
 
         info!("Freqs: {:?}", Debug2Format(&freqs));
         info!("Times: {:?}", Debug2Format(&times));
-
     }
-
 }
 
 fn parse_json<'a>(unparsed_response: &'a str) -> JSONValue<'a> {
@@ -452,91 +472,88 @@ async fn connection(mut controller: WifiController<'static>) {
 }
 
 async fn send_get(
-    stack: Stack<'_>,
-    tls_seed: u64,
+    mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
     name: String,
     song: bool,
     init: bool,
 ) -> Result<String, MyError> {
-    let mut tx_buffer = [0; 4096];
-    let mut rx_buffer = [0; 4096 * 5];
     let mut http_buf = [0; 4096];
-    const TCP_RX: usize = 4096;
-    const TCP_TX: usize = 4096;
+    // const TCP_RX: usize = 4096;
+    // const TCP_TX: usize = 4096;
 
-    let dns = DnsSocket::new(stack);
-    let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
-    let tcp = TcpClient::new(stack, &tcp_state);
+    // let dns = DnsSocket::new(stack);
+    // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
+    // let tcp = TcpClient::new(stack, &tcp_state);
 
-    let tls = TlsConfig::new(
-        tls_seed,
-        &mut rx_buffer,
-        &mut tx_buffer,
-        reqwless::client::TlsVerify::None,
-    );
+    // let mut client = HttpClient::new(&tcp, &dns);
+    // let mut url = ArrForm::<64>::new();
+    let mut url: heapless::String<128> = heapless::String::new();
 
-    info!("Tls config done");
-
-    let mut client = HttpClient::new_with_tls(&tcp, &dns, tls);
-    info!("Tls http client ok");
-    let mut url = ArrForm::<64>::new();
-    
     if init {
-        let values = ["nevergonnagiveyouup", "doom"];
+        let values = [
+            "http://iotjukebox.onrender.com/preference?id=40093918&key=Pixel1&value=nevergonnagiveyouup",
+            "http://iotjukebox.onrender.com/preference?id=40093918&key=Pixel2&value=doom",
+        ];
 
-        for value in values{
-            url = arrform!(
-                64,
-                "https://iotjukebox.onrender.com/preference?id=40093918&key='{}'&value={}",
-                name,
-                value
-            );
+        for value in values {
+            let http_req = client.request(reqwless::request::Method::POST, value).await;
+            info!("init, posting preferences");
+            match http_req {
+                Ok(mut val) => {
+                    // let response = val.send(&mut http_buf).await.unwrap();
 
-            let mut http_req = client
-                .request(reqwless::request::Method::POST, url.as_str())
-                .await
-                .unwrap();
-            info!("http post request ok");
+                    let response = match val.send(&mut http_buf).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("POST send failed: {:?}", Debug2Format(&e));
+                            return Err(MyError::Network(e));
+                        }
+                    };
+                    info!("http post request ok");
+                    info!("Response status: {:?}", Debug2Format(&response.status));
 
-            http_req.send(&mut http_buf).await.unwrap();
+                    for (name, val) in response.headers() {
+                        info!("hdr: {} = {} ", name, core::str::from_utf8(val).unwrap());
+                    }
 
+                    http_buf.fill(0);
+                }
+                Err(e) => {
+                    error!("why the fuck: {:?}", e);
+                    return Err(MyError::Http("fuck do i know"));
+                }
+            };
         }
 
         return Ok(String::new());
     }
 
-
-
     if song {
-        url = arrform!(
-            64,
-            "https://iotjukebox.onrender.com/song?name='{}'",
-            name
-        );
-
+        url.push_str("http://iotjukebox.onrender.com/song?name=")
+            .unwrap();
+        url.push_str(name.as_str()).unwrap();
     } else {
-        url = arrform!(
-            64,
-            "https://iotjukebox.onrender.com/preference?id=40093918&key='{}'",
-            name
-        );
+        url.push_str("http://iotjukebox.onrender.com/preference?id=40093918&key=")
+            .unwrap();
+        url.push_str(name.as_str()).unwrap();
     }
 
-    // let url = write!("https://iotjukebox.onrender.com/preference?id=40093918&key='{}'", name);
+    info!("Url: {}", url.as_str());
+
     let mut http_req = client
         .request(reqwless::request::Method::GET, url.as_str())
         .await
-        .unwrap();
+        .map_err(MyError::Network)?;
+
     info!("http request ok");
 
     let response = http_req.send(&mut http_buf).await.unwrap();
-
 
     info!("Got response");
     let res = response.body().read_to_end().await.unwrap();
 
     let content = core::str::from_utf8(res).unwrap();
-    info!("{}", content);
+    info!("{:?}", content);
 
     let content = String::from_str(content).unwrap();
     Ok(content)
@@ -560,7 +577,7 @@ async fn send_get(
 //     let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, config);
 
 //     let mut request = client
-//         .request(reqwless::request::Method::GET, "https://www.google.com")
+//         .request(reqwless::request::Method::GET, "http://www.google.com")
 //         .await
 //         .unwrap()
 //         .content_type(reqwless::headers::ContentType::TextPlain)
