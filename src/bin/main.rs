@@ -113,7 +113,7 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 96 * 1024);
     // COEX needs more RAM - so we've added some more
-    esp_alloc::heap_allocator!(size: 24 * 1024);
+    // esp_alloc::heap_allocator!(size: 24 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
@@ -167,7 +167,7 @@ async fn main(spawner: Spawner) -> ! {
     let buzzer_pin = peripherals.GPIO21;
     // show_song_name();
     spawner.spawn(player(leddc_pin, buzzer_pin)).ok();
-    spawner.spawn(run_director(sta_stack)).ok();
+    spawner.spawn(run_director(sta_stack, tls_seed)).ok();
 
     spawner.spawn(ble_scanner_run(ble_controller)).ok();
 
@@ -178,8 +178,17 @@ async fn main(spawner: Spawner) -> ! {
     // for inspiration have a look at the examples at http://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
 }
 
+// static mut TLS_RX_BUF: [u8; 4096*5] = [0; 4096*5];
+// static mut TLS_TX_BUF: [u8; 4096] = [0; 4096];
+// static mut HTTP_BUF: [u8; 4096] = [0; 4096];
+
 #[embassy_executor::task]
-pub async fn run_director(stack: Stack<'static>) {
+pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
+    // const TCP_RX: usize = 4096;
+    // const TCP_TX: usize = 4096;
+
+    let mut tx_buffer = [0; 4096];
+    let mut rx_buffer = [0; 16640];
     const TCP_RX: usize = 4096;
     const TCP_TX: usize = 4096;
 
@@ -187,8 +196,26 @@ pub async fn run_director(stack: Stack<'static>) {
     let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
     let tcp = TcpClient::new(stack, &tcp_state);
 
-    let mut client = HttpClient::new(&tcp, &dns);
+    let tls = TlsConfig::new(
+        tls_seed,
+        &mut rx_buffer,
+        &mut tx_buffer,
+        reqwless::client::TlsVerify::None,
+    );
+
+    info!("Tls config done");
+
+    let mut client = HttpClient::new_with_tls(&tcp, &dns, tls);
+    info!("Tls http client ok");
+
+
+    // let dns = DnsSocket::new(stack);
+    // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
+    // let tcp = TcpClient::new(stack, &tcp_state);
+
+    // let mut client = HttpClient::new(&tcp, &dns);
     let _ = send_get(&mut client, String::new(), false, true).await;
+
     INIT_SIGNAL.signal(());
 
     loop {
@@ -491,8 +518,8 @@ async fn send_get(
 
     if init {
         let values = [
-            "http://iotjukebox.onrender.com/preference?id=40093918&key=Pixel1&value=nevergonnagiveyouup",
-            "http://iotjukebox.onrender.com/preference?id=40093918&key=Pixel2&value=doom",
+            "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel1&value=nevergonnagiveyouup",
+            "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel2&value=doom",
         ];
 
         for value in values {
@@ -509,7 +536,7 @@ async fn send_get(
                             return Err(MyError::Network(e));
                         }
                     };
-                    info!("http post request ok");
+                    info!("https post request ok");
                     info!("Response status: {:?}", Debug2Format(&response.status));
 
                     for (name, val) in response.headers() {
@@ -529,11 +556,11 @@ async fn send_get(
     }
 
     if song {
-        url.push_str("http://iotjukebox.onrender.com/song?name=")
+        url.push_str("https://iotjukebox.onrender.com/song?name=")
             .unwrap();
         url.push_str(name.as_str()).unwrap();
     } else {
-        url.push_str("http://iotjukebox.onrender.com/preference?id=40093918&key=")
+        url.push_str("https://iotjukebox.onrender.com/preference?id=40093918&key=")
             .unwrap();
         url.push_str(name.as_str()).unwrap();
     }
@@ -545,7 +572,7 @@ async fn send_get(
         .await
         .map_err(MyError::Network)?;
 
-    info!("http request ok");
+    info!("https request ok");
 
     let response = http_req.send(&mut http_buf).await.unwrap();
 
