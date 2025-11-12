@@ -9,9 +9,9 @@
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use core::cell::RefCell;
-use core::{error, str};
 use core::fmt::Write;
 use core::str::FromStr;
+use core::{error, str};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use heapless::Deque;
@@ -217,7 +217,7 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
 
     let mut client = DefaultHttpClient::new(&stack);
 
-    let mut tiny_buffer = [0u8; 4* 1024];
+    let mut tiny_buffer = [0u8; 4 * 1024];
     // let headers = [
     //         HttpHeader::user_agent("MyApp/1.0"),
     // ];
@@ -296,7 +296,10 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
         }
     }
 }
-async fn send_post_nano(client: &HttpClient<'_>, mut buffer: [u8; 4* 1024]) -> Result<(), MyError> {
+async fn send_post_nano(
+    client: &HttpClient<'_>,
+    mut buffer: [u8; 4 * 1024],
+) -> Result<(), MyError> {
     let values = [
         "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel1&value=nevergonnagiveyouup",
         "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel2&value=doom",
@@ -322,17 +325,15 @@ async fn send_post_nano(client: &HttpClient<'_>, mut buffer: [u8; 4* 1024]) -> R
         }
     }
 
-
     return Ok(());
 }
 
 async fn send_get_nano(
     client: &HttpClient<'_>,
-    mut buffer: [u8; 4* 1024],
+    mut buffer: [u8; 4 * 1024],
     song: bool,
     name: String,
 ) -> Result<String, MyError> {
-
     info!("Sending get {}", name.as_str());
     let headers = [HttpHeader::user_agent("MyApp/1.0")];
 
@@ -704,7 +705,6 @@ async fn player(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {
 }
 
 fn parse_json<'a>(unparsed_response: &'a str) -> Result<JSONValue<'a>, MyError> {
-
     error!("unparsed_response chars: \n");
 
     for cha in unparsed_response.chars() {
@@ -714,8 +714,9 @@ fn parse_json<'a>(unparsed_response: &'a str) -> Result<JSONValue<'a>, MyError> 
     let mut clean = unparsed_response;
 
     for char in unparsed_response.chars() {
-
-        if char == '{' {break};
+        if char == '{' {
+            break;
+        };
         clean = &clean[1..];
     }
 
@@ -723,7 +724,6 @@ fn parse_json<'a>(unparsed_response: &'a str) -> Result<JSONValue<'a>, MyError> 
     //     clean = _clean.trim();
     // }
     warn!("clean: {}", clean);
-
 
     match JSONValue::load_and_verify(clean) {
         Ok(val) => Ok(val),
