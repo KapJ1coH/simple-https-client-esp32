@@ -3,6 +3,7 @@ runner = "espflash flash --monitor --chip esp32 --log-format defmt"
 
 [env]
 DEFMT_LOG="info"
+EMBASSY_EXECUTOR_TASK_ARENA_SIZE="16384"
 
 [build]
 rustflags = [
