@@ -87,6 +87,7 @@ heapless = { version = "0.9.1", features = ["defmt"] }
 embassy-futures = { version = "0.1.2", features = ["defmt"] }
 embassy-sync = { version = "0.7.2", features = ["defmt"] }
 arrform = "0.1.1"
+nanofish = { version = "0.9.1", features = ["tls"] }
 
 
 [profile.dev]

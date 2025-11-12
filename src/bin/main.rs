@@ -8,13 +8,14 @@
 
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use embassy_sync::mutex::Mutex;
 use core::cell::RefCell;
-use core::error;
+use core::{error, str};
 use core::fmt::Write;
 use core::str::FromStr;
+use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use heapless::Deque;
+use nanofish::{DefaultHttpClient, HttpClient, HttpHeader, ResponseBody};
 
 use alloc::string::String;
 // use arrform::{ArrForm, arrform};
@@ -46,7 +47,7 @@ use esp_radio::{
     wifi::{self, ClientConfig, ModeConfig},
 };
 use microjson::JSONValue;
-use reqwless::client::{HttpClient, HttpRequestHandle, TlsConfig};
+// use reqwless::client::{HttpClient, HttpRequestHandle, TlsConfig};
 use reqwless::{self};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
@@ -87,6 +88,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[derive(Debug, Format)]
 pub enum MyError {
     Http(&'static str),
+    Json(&'static str),
+    Nano(nanofish::Error),
     Network(reqwless::Error),
 }
 
@@ -182,35 +185,42 @@ async fn main(spawner: Spawner) -> ! {
 // static mut TLS_RX_BUF: [u8; 4096*5] = [0; 4096*5];
 // static mut TLS_TX_BUF: [u8; 4096] = [0; 4096];
 // static mut HTTP_BUF: [u8; 4096] = [0; 4096];
-static RX_BUFFER_CELL: StaticCell<[u8; 16640]> = StaticCell::new();
-static TX_BUFFER_CELL: StaticCell<[u8; 4096]> = StaticCell::new();
+// static RX_BUFFER_CELL: StaticCell<[u8; 16640]> = StaticCell::new();
+// static TX_BUFFER_CELL: StaticCell<[u8; 4096]> = StaticCell::new();
 
 #[embassy_executor::task]
 pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
     // const TCP_RX: usize = 4096;
     // const TCP_TX: usize = 4096;
 
-    let tx_buffer = TX_BUFFER_CELL.init([0; 4096]);
-    let rx_buffer = RX_BUFFER_CELL.init([0; 16640]);
-    const TCP_RX: usize = 4096;
-    const TCP_TX: usize = 4096;
+    // let tx_buffer = TX_BUFFER_CELL.init([0; 4096]);
+    // let rx_buffer = RX_BUFFER_CELL.init([0; 16640]);
+    // const TCP_RX: usize = 4096;
+    // const TCP_TX: usize = 4096;
 
-    let dns = DnsSocket::new(stack);
-    let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
-    let tcp = TcpClient::new(stack, &tcp_state);
+    // let dns = DnsSocket::new(stack);
+    // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
+    // let tcp = TcpClient::new(stack, &tcp_state);
 
-    let tls = TlsConfig::new(
-        tls_seed,
-        rx_buffer,
-        tx_buffer,
-        reqwless::client::TlsVerify::None,
-    );
+    // let tls = TlsConfig::new(
+    //     tls_seed,
+    //     rx_buffer,
+    //     tx_buffer,
+    //     reqwless::client::TlsVerify::None,
+    // );
 
-    info!("Tls config done");
+    // info!("Tls config done");
 
-    let mut client = HttpClient::new_with_tls(&tcp, &dns, tls);
-    info!("Tls http client ok");
+    // let mut client = HttpClient::new_with_tls(&tcp, &dns, tls);
+    // info!("Tls http client ok");
+    //
 
+    let mut client = DefaultHttpClient::new(&stack);
+
+    let mut tiny_buffer = [0u8; 4* 1024];
+    // let headers = [
+    //         HttpHeader::user_agent("MyApp/1.0"),
+    // ];
 
     // let dns = DnsSocket::new(stack);
     // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
@@ -218,36 +228,40 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
 
     // let mut client = HttpClient::new(&tcp, &dns);
     //
-    let _ = send_post(&mut client).await;
+    // let _ = send_post(&mut client).await;
+    // warn!("One post set");
+    let _ = send_post_nano(&client, tiny_buffer).await;
     warn!("One post set");
     // let _ = send_get(&mut client, "Pixel2".to_owned(), false, false).await;
     // warn!("sent get test");
 
+    // let _ = send_get_nano(&client, tiny_buffer, false, "Pixel1".to_owned()).await;
+    // let _ = send_get_nano(&client, tiny_buffer, true, "doom".to_owned()).await;
 
     INIT_SIGNAL.signal(());
 
-    // let _ = send_post(&mut client).await;
+    // // let _ = send_post(&mut client).await;
     loop {
-        Timer::after(Duration::from_secs(1));
+        // Timer::after(Duration::from_secs(1));
         let event = receive_enent().await;
         // handle_event(event, &mut client).await;
         match event {
             Event::DetectedDevice(name) => {
                 info!("DetectedDevice");
+                // let mut client = DefaultHttpClient::new(&stack);
                 let response: Result<String, MyError> = match name.as_str() {
                     "Pixel1" | "Pixel2" => {
-                        send_get(&mut client, name, false, false).await
+                        // send_get(&mut client, name, false, false).await
+                        send_get_nano(&client, tiny_buffer, false, name).await
                     }
                     _ => {
                         info!("Not a pixel");
-                        return ;
+                        return;
                     }
                 };
                 match response {
                     Ok(value) => {
-                        
-
-                        let json_response = parse_json(&value);
+                        let json_response = parse_json(&value).unwrap();
                         if json_response.get_key_value("error").is_ok() {
                             error!("Device does not exist")
                         } else if json_response.get_key_value("name").is_ok() {
@@ -259,9 +273,13 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
                                 .unwrap()
                                 .trim_matches('"');
 
-                            match send_get(&mut client, song_name.into(), true, false).await {
+                            match send_get_nano(&client, tiny_buffer, true, song_name.to_owned())
+                                .await
+                            {
                                 Ok(response) => {
-                                    let json_respnse = parse_json(&response);
+                                    let json_respnse = parse_json(&response).unwrap();
+
+                                    warn!("Json response: {:?}", Debug2Format(&json_respnse));
                                 }
                                 Err(e) => error!("Error getting song name {}", song_name),
                             }
@@ -278,70 +296,49 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
         }
     }
 }
-
-async fn send_post(
-    mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
-) -> Result<String, MyError> {
-
+async fn send_post_nano(client: &HttpClient<'_>, mut buffer: [u8; 4* 1024]) -> Result<(), MyError> {
     let values = [
         "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel1&value=nevergonnagiveyouup",
         "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel2&value=doom",
     ];
+    let headers = [HttpHeader::user_agent("MyApp/1.0")];
+
+    buffer.fill(0);
+    let body = "";
 
     for value in values {
-        let http_req = client.request(reqwless::request::Method::POST, value).await;
-        info!("init, posting preferences");
-        match http_req {
-            Ok(mut val) => {
-                // let response = val.send(&mut http_buf).await.unwrap();
-                let mut http_buf = HTTP_BUF_MUTEX.lock().await;
-                http_buf.fill(0);
+        let (response, bytes_read) = client
+            .post(value, &headers, body.as_bytes(), &mut buffer)
+            .await
+            .map_err(MyError::Nano)?;
 
-                let response = match val.send(&mut *http_buf).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("POST send failed: {:?}", Debug2Format(&e));
-                        return Err(MyError::Network(e));
-                    }
-                };
-                info!("https post request ok");
-                info!("Response status: {:?}", Debug2Format(&response.status));
-
-                for (name, val) in response.headers() {
-                    info!("hdr: {} = {} ", name, core::str::from_utf8(val).unwrap());
-                }
-
-                http_buf.fill(0);
-            }
-            Err(e) => {
-                error!("why the fuck: {:?}", e);
-                return Err(MyError::Http("fuck do i know"));
-            }
-        };
+        info!(
+            "Response: status {:?}, code: {:?}",
+            response.is_success(),
+            Debug2Format(&response.status_code)
+        );
+        if let Some(content_length) = response.content_length() {
+            info!("Content length: {} bytes", content_length);
+        }
     }
 
-    return Ok(String::new());
+
+    return Ok(());
 }
 
-// static HTTP_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
-async fn send_get(
-    mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
-    name: String,
+async fn send_get_nano(
+    client: &HttpClient<'_>,
+    mut buffer: [u8; 4* 1024],
     song: bool,
-    init: bool,
+    name: String,
 ) -> Result<String, MyError> {
-    // const TCP_RX: usize = 4096;
-    // const TCP_TX: usize = 4096;
 
-    // let dns = DnsSocket::new(stack);
-    // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
-    // let tcp = TcpClient::new(stack, &tcp_state);
+    info!("Sending get {}", name.as_str());
+    let headers = [HttpHeader::user_agent("MyApp/1.0")];
 
-    // let mut client = HttpClient::new(&tcp, &dns);
-    // let mut url = ArrForm::<64>::new();
     let mut url: heapless::String<128> = heapless::String::new();
 
-
+    buffer.fill(0);
     if song {
         url.push_str("https://iotjukebox.onrender.com/song?name=")
             .unwrap();
@@ -354,89 +351,188 @@ async fn send_get(
 
     info!("Url: {}", url.as_str());
 
-    let mut http_req = client
-        .request(reqwless::request::Method::GET, url.as_str())
+    let (response, _) = client
+        .get(url.as_str(), &headers, &mut buffer)
         .await
-        .map_err(MyError::Network)?;
+        .map_err(MyError::Nano)?;
 
-    info!("https request ok");
+    info!(
+        "Response: status {:?}, code: {:?}",
+        response.is_success(),
+        Debug2Format(&response.status_code)
+    );
+    if let Some(content_length) = response.content_length() {
+        info!("Content length: {} bytes", content_length);
+    }
 
-    let mut http_buf = HTTP_BUF_MUTEX.lock().await;
-    http_buf.fill(0);
-    let response = http_req.send(&mut *http_buf).await.unwrap();
-    // for (name, val) in response.headers() {
-    //     info!("hdr: {} = {} ", name, core::str::from_utf8(val).unwrap());
-    // }
-
-    info!("Got response");
-    let res = response.body().read_to_end().await.unwrap();
-
-    // info!("format: {:?}", response.format(defmt::Format));
-
-    let content = core::str::from_utf8(res).unwrap();
-    info!("{:?}", content);
-
-    let content = String::from_str(content).unwrap();
-    Ok(content)
-}
-
-
-/// Handles the events sent through the channel.
-/// It will route the event to it's proper destination depending on the the type of the event.
-///
-/// For example, ParkingStateChange will go to the network to get ready for transmission.
-async fn handle_event(
-    event: Event,
-    mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
-) {
-    match event {
-        Event::DetectedDevice(name) => {
-            info!("DetectedDevice");
-            // let _ = send_post(client).await;
-            warn!("Two plus post set");
-            let response: Result<String, MyError> = match name.as_str() {
-                "Pixel1" | "Pixel2" => {
-                    send_get(client, name, false, false).await
-                }
-                _ => {
-                    info!("Not a pixel");
-                    return ;
-                }
-            };
-            match response {
-                Ok(value) => {
-                    
-
-                    let json_response = parse_json(&value);
-                    if json_response.get_key_value("error").is_ok() {
-                        error!("Device does not exist")
-                    } else if json_response.get_key_value("name").is_ok() {
-                        info!("Got the name, sending request");
-                        let song_name = json_response
-                            .get_key_value("name")
-                            .unwrap()
-                            .read_string()
-                            .unwrap()
-                            .trim_matches('"');
-
-                        match send_get(client, song_name.into(), true, false).await {
-                            Ok(response) => {
-                                let json_respnse = parse_json(&response);
-                            }
-                            Err(e) => error!("Error getting song name {}", song_name),
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("DetectedDevice failure, no clue {:?}", e);
-                }
-            }
+    match response.body {
+        ResponseBody::Text(text) => {
+            info!("Text response: {}", text);
+            return Ok(text.to_owned());
         }
-        Event::ControllerRequest => {
-            todo!()
+
+        _ => {
+            return Err(MyError::Http("invalid string"));
         }
     }
 }
+
+// async fn send_post(
+//     mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
+// ) -> Result<String, MyError> {
+
+//     let values = [
+//         "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel1&value=nevergonnagiveyouup",
+//         "https://iotjukebox.onrender.com/preference?id=40093918&key=Pixel2&value=doom",
+//     ];
+
+//     for value in values {
+//         let http_req = client.request(reqwless::request::Method::POST, value).await;
+//         info!("init, posting preferences");
+//         match http_req {
+//             Ok(mut val) => {
+//                 // let response = val.send(&mut http_buf).await.unwrap();
+//                 let mut http_buf = HTTP_BUF_MUTEX.lock().await;
+//                 http_buf.fill(0);
+
+//                 let response = match val.send(&mut *http_buf).await {
+//                     Ok(r) => r,
+//                     Err(e) => {
+//                         error!("POST send failed: {:?}", Debug2Format(&e));
+//                         return Err(MyError::Network(e));
+//                     }
+//                 };
+//                 info!("https post request ok");
+//                 info!("Response status: {:?}", Debug2Format(&response.status));
+
+//                 for (name, val) in response.headers() {
+//                     info!("hdr: {} = {} ", name, core::str::from_utf8(val).unwrap());
+//                 }
+
+//                 http_buf.fill(0);
+//             }
+//             Err(e) => {
+//                 error!("why the fuck: {:?}", e);
+//                 return Err(MyError::Http("fuck do i know"));
+//             }
+//         };
+//     }
+
+//     return Ok(String::new());
+// }
+
+// // static HTTP_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
+// async fn send_get(
+//     mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
+//     name: String,
+//     song: bool,
+//     init: bool,
+// ) -> Result<String, MyError> {
+//     // const TCP_RX: usize = 4096;
+//     // const TCP_TX: usize = 4096;
+
+//     // let dns = DnsSocket::new(stack);
+//     // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
+//     // let tcp = TcpClient::new(stack, &tcp_state);
+
+//     // let mut client = HttpClient::new(&tcp, &dns);
+//     // let mut url = ArrForm::<64>::new();
+//     let mut url: heapless::String<128> = heapless::String::new();
+
+//     if song {
+//         url.push_str("https://iotjukebox.onrender.com/song?name=")
+//             .unwrap();
+//         url.push_str(name.as_str()).unwrap();
+//     } else {
+//         url.push_str("https://iotjukebox.onrender.com/preference?id=40093918&key=")
+//             .unwrap();
+//         url.push_str(name.as_str()).unwrap();
+//     }
+
+//     info!("Url: {}", url.as_str());
+
+//     let mut http_req = client
+//         .request(reqwless::request::Method::GET, url.as_str())
+//         .await
+//         .map_err(MyError::Network)?;
+
+//     info!("https request ok");
+
+//     let mut http_buf = HTTP_BUF_MUTEX.lock().await;
+//     http_buf.fill(0);
+//     let response = http_req.send(&mut *http_buf).await.unwrap();
+//     // for (name, val) in response.headers() {
+//     //     info!("hdr: {} = {} ", name, core::str::from_utf8(val).unwrap());
+//     // }
+
+//     info!("Got response");
+//     let res = response.body().read_to_end().await.unwrap();
+
+//     // info!("format: {:?}", response.format(defmt::Format));
+
+//     let content = core::str::from_utf8(res).unwrap();
+//     info!("{:?}", content);
+
+//     let content = String::from_str(content).unwrap();
+//     Ok(content)
+// }
+
+// /// Handles the events sent through the channel.
+// /// It will route the event to it's proper destination depending on the the type of the event.
+// ///
+// /// For example, ParkingStateChange will go to the network to get ready for transmission.
+// async fn handle_event(
+//     event: Event,
+//     mut client: &mut HttpClient<'_, TcpClient<'_, 1, 4096, 4096>, DnsSocket<'_>>,
+// ) {
+//     match event {
+//         Event::DetectedDevice(name) => {
+//             info!("DetectedDevice");
+//             // let _ = send_post(client).await;
+//             warn!("Two plus post set");
+//             let response: Result<String, MyError> = match name.as_str() {
+//                 "Pixel1" | "Pixel2" => {
+//                     send_get(client, name, false, false).await
+//                 }
+//                 _ => {
+//                     info!("Not a pixel");
+//                     return ;
+//                 }
+//             };
+//             match response {
+//                 Ok(value) => {
+//
+
+//                     let json_response = parse_json(&value);
+//                     if json_response.get_key_value("error").is_ok() {
+//                         error!("Device does not exist")
+//                     } else if json_response.get_key_value("name").is_ok() {
+//                         info!("Got the name, sending request");
+//                         let song_name = json_response
+//                             .get_key_value("name")
+//                             .unwrap()
+//                             .read_string()
+//                             .unwrap()
+//                             .trim_matches('"');
+
+//                         match send_get(client, song_name.into(), true, false).await {
+//                             Ok(response) => {
+//                                 let json_respnse = parse_json(&response);
+//                             }
+//                             Err(e) => error!("Error getting song name {}", song_name),
+//                         }
+//                     }
+//                 }
+//                 Err(e) => {
+//                     error!("DetectedDevice failure, no clue {:?}", e);
+//                 }
+//             }
+//         }
+//         Event::ControllerRequest => {
+//             todo!()
+//         }
+//     }
+// }
 
 #[embassy_executor::task]
 async fn name_to_song(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {}
@@ -519,7 +615,9 @@ impl EventHandler for Printer {
                 if let Some(name) = clean_name
                     && !seen.iter().any(|b| b.raw() == addr.raw())
                 {
-                    if EVENT_CHANNEL
+                    if name != "Pixel1" && name != "Pixel2" {
+                        info!("Not a pixel, skip");
+                    } else if EVENT_CHANNEL
                         .sender()
                         .try_send(Event::DetectedDevice(name))
                         .is_err()
@@ -605,8 +703,35 @@ async fn player(leddc_pin: LEDC<'static>, buzzer_pin: GPIO21<'static>) {
     }
 }
 
-fn parse_json<'a>(unparsed_response: &'a str) -> JSONValue<'a> {
-    JSONValue::load_and_verify(unparsed_response).unwrap()
+fn parse_json<'a>(unparsed_response: &'a str) -> Result<JSONValue<'a>, MyError> {
+
+    error!("unparsed_response chars: \n");
+
+    for cha in unparsed_response.chars() {
+        warn!("char: {}", cha);
+    }
+
+    let mut clean = unparsed_response;
+
+    for char in unparsed_response.chars() {
+
+        if char == '{' {break};
+        clean = &clean[1..];
+    }
+
+    // if let Some(_clean) =  unparsed_response.strip_prefix('f') {
+    //     clean = _clean.trim();
+    // }
+    warn!("clean: {}", clean);
+
+
+    match JSONValue::load_and_verify(clean) {
+        Ok(val) => Ok(val),
+        Err(_) => {
+            error!("Error unparsing: {}", clean);
+            Err(MyError::Json("Weird error"))
+        }
+    }
 }
 
 // #[embassy_executor::task]
@@ -666,7 +791,6 @@ async fn connection(mut controller: WifiController<'static>) {
 }
 
 static HTTP_BUF_MUTEX: Mutex<CriticalSectionRawMutex, [u8; 4096]> = Mutex::new([0; 4096]);
-
 
 // #[embassy_executor::task]
 // async fn https_get(stack: Stack<'static, WifiDevice<'static>>) {

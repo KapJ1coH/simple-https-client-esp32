@@ -27,6 +27,7 @@ dependencies = [
  "esp-rtos",
  "heapless 0.9.1",
  "microjson",
+ "nanofish",
  "reqwless",
  "smoltcp",
  "ssd1306",
@@ -1609,6 +1610,22 @@ name = "microjson"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66f607672273239fe03881b7ce95721079e1d08f6a7ef98da2b144f68fe1502c"
+
+[[package]]
+name = "nanofish"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ade54f076e18efc9b076b33a6540eb08bc3cc8d22895d2232c5965a59c1d9f97"
+dependencies = [
+ "defmt 1.0.1",
+ "embassy-net",
+ "embassy-time",
+ "embedded-io-async 0.6.1",
+ "embedded-tls",
+ "heapless 0.9.1",
+ "rand_chacha",
+ "rand_core 0.6.4",
+]
 
 [[package]]
 name = "nb"
