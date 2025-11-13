@@ -182,69 +182,20 @@ async fn main(spawner: Spawner) -> ! {
     // for inspiration have a look at the examples at http://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
 }
 
-// static mut TLS_RX_BUF: [u8; 4096*5] = [0; 4096*5];
-// static mut TLS_TX_BUF: [u8; 4096] = [0; 4096];
-// static mut HTTP_BUF: [u8; 4096] = [0; 4096];
-// static RX_BUFFER_CELL: StaticCell<[u8; 16640]> = StaticCell::new();
-// static TX_BUFFER_CELL: StaticCell<[u8; 4096]> = StaticCell::new();
 
 #[embassy_executor::task]
 pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
-    // const TCP_RX: usize = 4096;
-    // const TCP_TX: usize = 4096;
-
-    // let tx_buffer = TX_BUFFER_CELL.init([0; 4096]);
-    // let rx_buffer = RX_BUFFER_CELL.init([0; 16640]);
-    // const TCP_RX: usize = 4096;
-    // const TCP_TX: usize = 4096;
-
-    // let dns = DnsSocket::new(stack);
-    // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
-    // let tcp = TcpClient::new(stack, &tcp_state);
-
-    // let tls = TlsConfig::new(
-    //     tls_seed,
-    //     rx_buffer,
-    //     tx_buffer,
-    //     reqwless::client::TlsVerify::None,
-    // );
-
-    // info!("Tls config done");
-
-    // let mut client = HttpClient::new_with_tls(&tcp, &dns, tls);
-    // info!("Tls http client ok");
-    //
 
     let mut client = DefaultHttpClient::new(&stack);
 
     let mut tiny_buffer = [0u8; 4 * 1024];
-    // let headers = [
-    //         HttpHeader::user_agent("MyApp/1.0"),
-    // ];
-
-    // let dns = DnsSocket::new(stack);
-    // let tcp_state = TcpClientState::<1, TCP_RX, TCP_TX>::new();
-    // let tcp = TcpClient::new(stack, &tcp_state);
-
-    // let mut client = HttpClient::new(&tcp, &dns);
-    //
-    // let _ = send_post(&mut client).await;
-    // warn!("One post set");
     let _ = send_post_nano(&client, tiny_buffer).await;
     warn!("One post set");
-    // let _ = send_get(&mut client, "Pixel2".to_owned(), false, false).await;
-    // warn!("sent get test");
-
-    // let _ = send_get_nano(&client, tiny_buffer, false, "Pixel1".to_owned()).await;
-    // let _ = send_get_nano(&client, tiny_buffer, true, "doom".to_owned()).await;
 
     INIT_SIGNAL.signal(());
 
-    // // let _ = send_post(&mut client).await;
     loop {
-        // Timer::after(Duration::from_secs(1));
         let event = receive_enent().await;
-        // handle_event(event, &mut client).await;
         match event {
             Event::DetectedDevice(name) => {
                 info!("DetectedDevice");
@@ -277,7 +228,10 @@ pub async fn run_director(stack: Stack<'static>, tls_seed: u64) {
                                 .await
                             {
                                 Ok(response) => {
-                                    let json_respnse = parse_json(&response).unwrap();
+                                    
+                                    let json_respnse = parse_json(mk_static!(String, response)).unwrap();
+
+                                    SONG_EVENT_CHANNEL.sender().send(json_respnse).await;
 
                                     warn!("Json response: {:?}", Debug2Format(&json_respnse));
                                 }
